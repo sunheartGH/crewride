@@ -1,6 +1,6 @@
 [package]
 name = "crewride"
-version = "0.0.2"
+version = "0.0.3"
 authors = ["fn-a <mr.fna.co@gmail.com>"]
 edition = "2024"
 repository = "https://github.com/fn-a/crewride"
@@ -19,4 +19,16 @@ chrono = "^0.4"
 url = { version = "^2.5", features = ["serde"] }
 eventsource-stream = "^0.2"
 anyhow = "^1.0"
+thiserror = "^2.0"
+tracing = "^0.1"
+tracing-subscriber = { version = "^0.3", features = ["env-filter", "json"] }
+tower = "^0.5"
+tower-http = { version = "^0.6", features = ["cors", "trace"] }
+once_cell = "^1.20"
+parking_lot = "^0.12"
+uuid = { version = "^1.0", features = ["v4"] }
+
 aidapter = "0.0.2"
+
+[dev-dependencies]
+tokio-test = "^0.4"

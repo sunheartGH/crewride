@@ -8,12 +8,11 @@ use aidapter::{
     anthropic::prefix::{AnthropicChatResponse,AnthropicStreamEvent, AnthropicStreamChunk},
     openai::prefix::{OpenAIChatResponse,OpenAIStreamChunk},
 };
-
-// ============ 流式转换: Anthropic → OpenAI ============
+use crate::error::ProxyError;
 
 pub async fn from_anthropic_streaming(
     response: reqwest::Response,
-) -> Result<Response, StatusCode> {
+) -> Result<Response, ProxyError> {
     use eventsource_stream::Eventsource;
 
     let byte_stream = response.bytes_stream();
@@ -26,13 +25,11 @@ pub async fn from_anthropic_streaming(
                     return None;
                 }
 
-                // 使用类型化转换器解析Anthropic事件
                 let event: AnthropicStreamEvent = match serde_json::from_str(&event.data) {
                     Ok(event) => event,
                     Err(_) => return None,
                 };
 
-                // 转换为OpenAI流式块并序列化为SSE
                 let chunk_id = "chatcmpl-anthropic";
                 let model = "claude";
                 let chunks = Vec::<OpenAIStreamChunk>::from(&AnthropicStreamChunk {
@@ -41,7 +38,6 @@ pub async fn from_anthropic_streaming(
                     event: event,
                 });
                 
-                // 转换为字节流
                 Some(Ok::<_, std::io::Error>(
                     chunks.into_iter().flat_map(|s| Vec::<u8>::from(&s)).collect::<Vec<u8>>()
                 ))
@@ -54,13 +50,11 @@ pub async fn from_anthropic_streaming(
     Ok((StatusCode::OK, [("content-type", "text/event-stream")], body).into_response())
 }
 
-// ============ 非流式响应转换 ============
-
-pub async fn from_anthropic_response(response: reqwest::Response) -> Result<Response, StatusCode> {
+pub async fn from_anthropic_response(response: reqwest::Response) -> Result<Response, ProxyError> {
     let resp: AnthropicChatResponse  = response
         .json()
         .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(|_| ProxyError::Internal("Failed to parse response".to_string()))?;
 
     Ok(Json(OpenAIChatResponse::from(&resp)).into_response())
 }

@@ -11,92 +11,133 @@ use aidapter::{
     openai::prefix::OpenAIChatRequest,
     gemini::prefix::GeminiChatRequest,
 };
+use crate::config::AppState;
+use crate::error::ProxyError;
 
-use crate::config::ProxyState;
-
-mod openai;
-mod gemini;
-
-// ============ Anthropic 端点处理器 ============
+pub mod openai;
+pub mod gemini;
 
 pub async fn handler(
     headers: HeaderMap,
-    State(state): State<Arc<ProxyState>>,
+    State(state): State<Arc<AppState>>,
     Json(mut req): Json<AnthropicChatRequest>,
-) -> Result<Response, StatusCode> {
-    // 提取请求头中的API key
-    let mut api_key = headers.get("x-api-key")
+) -> Result<Response, ProxyError> {
+    let request_key = headers.get("x-api-key")
         .and_then(|key| key.to_str().ok())
         .map(|key| key.to_string())
         .unwrap_or_default();
+
     let mut provider_config = None;
     let mut replace_config = None;
-    // 查找模型配置
+
     if let Some(model_config) = state.config.find_model(&req.model) {
-        // 如果模型有供应商配置
         if let Some(provider) = &model_config.provider {
             replace_config = model_config.replace.clone();
-            provider_config = state.config.find_provider(provider)
+            provider_config = state.config.find_provider(provider);
         }
     }
+
     if provider_config.is_none() {
         provider_config = state.config.give_provider(Provider::Anthropic);
     }
-    let provider_config = provider_config.ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
-    let mut replace_api_key = api_key.is_empty();
-    if let Some(replace_config) = replace_config {
-        replace_api_key = replace_config.api_key;
-        // 使用配置的模型名称替换请求中的模型名称
-        if let Some(model_config) = &replace_config.model {
-            req.model = model_config.clone();
+
+    let provider_config = provider_config.ok_or_else(|| ProxyError::ConfigError(
+        "No Anthropic provider configured".to_string()
+    ))?;
+
+    let mut replace_api_key = request_key.is_empty();
+
+    if let Some(ref replace_cfg) = replace_config {
+        replace_api_key = replace_cfg.api_key;
+        if let Some(model_name) = &replace_cfg.model {
+            req.model = model_name.clone();
         }
     }
-    if replace_api_key {
-        // 使用配置的API Key替换请求头中的API key
-        api_key = provider_config.api_key.clone()
-            .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
-    }
+
+    let api_key = if replace_api_key {
+        provider_config.api_key.clone()
+            .ok_or_else(|| ProxyError::ConfigError("API key not configured".to_string()))?
+    } else {
+        request_key
+    };
+
     let api_url = provider_config.api_url.clone()
-        .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
+        .ok_or_else(|| ProxyError::ConfigError("API URL not configured".to_string()))?;
 
-    println!("📥 Anthropic request: model={}, url={}", req.model, api_url);
+    let provider_key = &provider_config.key;
+    let is_streaming = req.stream.unwrap_or(false);
 
-    match provider_config.r#type {
+    state.stats.record_request(provider_key, &req.model);
+
+    if state.config.rate_limit.enabled {
+        let limit_result = state.rate_limiter.check_rate_limit(&api_key, 1);
+        if let crate::rate_limit::RateLimitResult::Denied { retry_after, .. } = limit_result {
+            return Err(ProxyError::RateLimitExceeded {
+                limit: 60,
+                window: "per minute".to_string(),
+                retry_after,
+            });
+        }
+    }
+
+    let circuit_breaker = state.circuit_breakers.get_or_create(
+        provider_key,
+        crate::circuit_breaker::CircuitBreakerConfig {
+            failure_threshold: state.config.circuit_breaker.failure_threshold,
+            success_threshold: state.config.circuit_breaker.success_threshold,
+            timeout: std::time::Duration::from_secs(state.config.circuit_breaker.timeout_secs),
+        }
+    );
+
+    if !circuit_breaker.is_allowed() {
+        return Err(ProxyError::CircuitOpen { provider: provider_key.clone() });
+    }
+
+    let result = match provider_config.r#type {
         Provider::Anthropic => straight(state, req, api_url, api_key).await,
         Provider::OpenAI => into_openai(state, req, api_url, api_key).await,
         Provider::Gemini => into_gemini(state, req, api_url, api_key).await,
+    };
+
+    match &result {
+        Ok(_) => circuit_breaker.record_success(),
+        Err(_) => circuit_breaker.record_failure(),
     }
+
+    result
 }
 
-// ============ Anthropic → Anthropic 直通 ============
-
 async fn straight(
-    state: Arc<ProxyState>,
+    state: Arc<AppState>,
     req: AnthropicChatRequest,
     api_url: Url,
     api_key: String,
-) -> Result<Response, StatusCode> {
+) -> Result<Response, ProxyError> {
     let is_streaming = req.stream.unwrap_or(false);
-    println!("⚡ Anthropic passthrough (stream={})", is_streaming);
 
     let response = state
         .client
         .post(
-            api_url
-                .join("/v1/messages")
-                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-                .as_str(),
+            api_url.join("/v1/messages").map_err(|_| ProxyError::ConfigError("Invalid URL".to_string()))?.as_str(),
         )
-        .header("x-api-key", api_key)
+        .header("x-api-key", &api_key)
         .header("anthropic-version", "2023-06-01")
         .header("content-type", "application/json")
         .json(&req)
         .send()
         .await
-        .map_err(|_| StatusCode::BAD_GATEWAY)?;
+        .map_err(|e| ProxyError::UpstreamError {
+            provider: "anthropic".to_string(),
+            message: e.to_string(),
+        })?;
 
     if !response.status().is_success() {
-        return Err(StatusCode::BAD_GATEWAY);
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(ProxyError::UpstreamError {
+            provider: "anthropic".to_string(),
+            message: format!("HTTP {}: {}", status.as_u16(), body),
+        });
     }
 
     if is_streaming {
@@ -104,42 +145,41 @@ async fn straight(
         let body = axum::body::Body::from_stream(stream);
         Ok((StatusCode::OK, [("content-type", "text/event-stream")], body).into_response())
     } else {
-        let resp: serde_json::Value = response
-            .json()
-            .await
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let resp: serde_json::Value = response.json().await.map_err(|_| ProxyError::Internal("Failed to parse response".to_string()))?;
         Ok(Json(resp).into_response())
     }
 }
 
-// ============ Anthropic → OpenAI ============
-
 async fn into_openai(
-    state: Arc<ProxyState>,
+    state: Arc<AppState>,
     req: AnthropicChatRequest,
     api_url: Url,
     api_key: String,
-) -> Result<Response, StatusCode> {
+) -> Result<Response, ProxyError> {
     let is_streaming = req.stream.unwrap_or(false);
-    println!("🔄 Anthropic → OpenAI (stream={})", is_streaming);
 
     let response = state
         .client
         .post(
-            api_url
-                .join("/v1/chat/completions")
-                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-                .as_str(),
+            api_url.join("/v1/chat/completions").map_err(|_| ProxyError::ConfigError("Invalid URL".to_string()))?.as_str(),
         )
         .header("authorization", format!("Bearer {}", api_key))
         .header("content-type", "application/json")
         .json(&OpenAIChatRequest::from(&req))
         .send()
         .await
-        .map_err(|_| StatusCode::BAD_GATEWAY)?;
+        .map_err(|e| ProxyError::UpstreamError {
+            provider: "openai".to_string(),
+            message: e.to_string(),
+        })?;
 
     if !response.status().is_success() {
-        return Err(StatusCode::BAD_GATEWAY);
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(ProxyError::UpstreamError {
+            provider: "openai".to_string(),
+            message: format!("HTTP {}: {}", status.as_u16(), body),
+        });
     }
 
     if is_streaming {
@@ -149,21 +189,15 @@ async fn into_openai(
     }
 }
 
-// ============ Anthropic → Gemini ============
-
 async fn into_gemini(
-    state: Arc<ProxyState>,
+    state: Arc<AppState>,
     req: AnthropicChatRequest,
     api_url: Url,
     api_key: String,
-) -> Result<Response, StatusCode> {
+) -> Result<Response, ProxyError> {
     let is_streaming = req.stream.unwrap_or(false);
-    println!("🔄 Anthropic → Gemini (stream={})", is_streaming);
-
-    // 转换请求: Anthropic -> Gemini
     let gemini_req = GeminiChatRequest::from(&req);
 
-    // 构建URL，根据是否流式选择不同端点
     let endpoint = if is_streaming {
         format!("/v1beta/models/{}:streamGenerateContent?key={}&alt=sse", req.model, api_key)
     } else {
@@ -173,19 +207,24 @@ async fn into_gemini(
     let response = state
         .client
         .post(
-            api_url
-                .join(&endpoint)
-                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-                .as_str(),
+            api_url.join(&endpoint).map_err(|_| ProxyError::ConfigError("Invalid URL".to_string()))?.as_str(),
         )
         .header("content-type", "application/json")
         .json(&gemini_req)
         .send()
         .await
-        .map_err(|_| StatusCode::BAD_GATEWAY)?;
+        .map_err(|e| ProxyError::UpstreamError {
+            provider: "gemini".to_string(),
+            message: e.to_string(),
+        })?;
 
     if !response.status().is_success() {
-        return Err(StatusCode::BAD_GATEWAY);
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(ProxyError::UpstreamError {
+            provider: "gemini".to_string(),
+            message: format!("HTTP {}: {}", status.as_u16(), body),
+        });
     }
 
     if is_streaming {

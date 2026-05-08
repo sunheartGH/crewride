@@ -1,6 +1,12 @@
-//! CrewRide - 双向流式代理服务器
-//!
-//! 支持OpenAI，Anthropic，Gemini API之间的无缝切换和转换
-
 pub mod config;
 pub mod handlers;
+
+pub mod error;
+pub mod stats;
+pub mod rate_limit;
+pub mod health;
+pub mod metrics;
+pub mod retry;
+pub mod circuit_breaker;
+
+pub mod middleware;

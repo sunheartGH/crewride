@@ -8,12 +8,11 @@ use aidapter::{
     anthropic::prefix::{AnthropicChatResponse, AnthropicStreamEvent, AnthropicStreamChunk},
     gemini::prefix::{GeminiChatResponse, GeminiStreamChunk},
 };
-
-// ============ 流式转换: Anthropic → Gemini ============
+use crate::error::ProxyError;
 
 pub async fn from_anthropic_streaming(
     response: reqwest::Response,
-) -> Result<Response, StatusCode> {
+) -> Result<Response, ProxyError> {
     use eventsource_stream::Eventsource;
 
     let byte_stream = response.bytes_stream();
@@ -26,13 +25,11 @@ pub async fn from_anthropic_streaming(
                     return None;
                 }
 
-                // 解析Anthropic事件
                 let anthropic_event: AnthropicStreamEvent = match serde_json::from_str(&event.data) {
                     Ok(evt) => evt,
                     Err(_) => return None,
                 };
 
-                // 构建AnthropicStreamChunk
                 let chunk_id = "msg_anthropic";
                 let model = "claude";
                 let anthropic_chunk = AnthropicStreamChunk {
@@ -41,10 +38,8 @@ pub async fn from_anthropic_streaming(
                     event: anthropic_event,
                 };
 
-                // 转换为Gemini流式块
                 let gemini_chunks = Vec::<GeminiStreamChunk>::from(&anthropic_chunk);
                 
-                // 序列化为Gemini SSE格式
                 let bytes: Vec<u8> = gemini_chunks
                     .iter()
                     .flat_map(|chunk| {
@@ -63,13 +58,11 @@ pub async fn from_anthropic_streaming(
     Ok((StatusCode::OK, [("content-type", "text/event-stream")], body).into_response())
 }
 
-// ============ 非流式响应转换 ============
-
-pub async fn from_anthropic_response(response: reqwest::Response) -> Result<Response, StatusCode> {
+pub async fn from_anthropic_response(response: reqwest::Response) -> Result<Response, ProxyError> {
     let resp: AnthropicChatResponse = response
         .json()
         .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(|_| ProxyError::Internal("Failed to parse response".to_string()))?;
 
     Ok(Json(GeminiChatResponse::from(&resp)).into_response())
 }

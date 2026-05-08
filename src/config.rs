@@ -3,8 +3,8 @@ use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 use url::Url;
 use aidapter::Provider;
-
-// ============ 配置结构 ============
+use parking_lot::RwLock;
+use std::sync::Arc;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -15,6 +15,157 @@ pub struct Config {
     pub providers: Vec<ProviderConfig>,
     #[serde(default)]
     pub models: Vec<ModelConfig>,
+    #[serde(default)]
+    pub stats: StatsConfig,
+    #[serde(default)]
+    pub rate_limit: RateLimitConfig,
+    #[serde(default)]
+    pub retry: RetryConfig,
+    #[serde(default)]
+    pub circuit_breaker: CircuitBreakerConfig,
+    #[serde(default)]
+    pub timeout: TimeoutConfig,
+    #[serde(default)]
+    pub shutdown: ShutdownConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StatsConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_retention_days")]
+    pub retention_days: u32,
+}
+
+fn default_retention_days() -> u32 { 30 }
+fn default_true() -> bool { true }
+
+impl Default for StatsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            retention_days: default_retention_days(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RateLimitConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_rpm")]
+    pub default_rpm: u32,
+    #[serde(default = "default_tpm")]
+    pub default_tpm: u32,
+    #[serde(default = "default_burst")]
+    pub burst: u32,
+}
+
+fn default_rpm() -> u32 { 60 }
+fn default_tpm() -> u32 { 100000 }
+fn default_burst() -> u32 { 10 }
+
+impl Default for RateLimitConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            default_rpm: default_rpm(),
+            default_tpm: default_tpm(),
+            burst: default_burst(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct RetryConfig {
+    #[serde(default = "default_max_attempts")]
+    pub max_attempts: u32,
+    #[serde(default = "default_initial_delay")]
+    pub initial_delay_ms: u64,
+    #[serde(default = "default_max_delay")]
+    pub max_delay_ms: u64,
+    #[serde(default = "default_backoff")]
+    pub backoff_multiplier: f64,
+}
+
+fn default_max_attempts() -> u32 { 3 }
+fn default_initial_delay() -> u64 { 100 }
+fn default_max_delay() -> u64 { 5000 }
+fn default_backoff() -> f64 { 2.0 }
+
+impl Default for RetryConfig {
+    fn default() -> Self {
+        Self {
+            max_attempts: default_max_attempts(),
+            initial_delay_ms: default_initial_delay(),
+            max_delay_ms: default_max_delay(),
+            backoff_multiplier: default_backoff(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct CircuitBreakerConfig {
+    #[serde(default = "default_failure_threshold")]
+    pub failure_threshold: u32,
+    #[serde(default = "default_success_threshold")]
+    pub success_threshold: u32,
+    #[serde(default = "default_timeout")]
+    pub timeout_secs: u64,
+}
+
+fn default_failure_threshold() -> u32 { 5 }
+fn default_success_threshold() -> u32 { 2 }
+fn default_timeout() -> u64 { 30 }
+
+impl Default for CircuitBreakerConfig {
+    fn default() -> Self {
+        Self {
+            failure_threshold: default_failure_threshold(),
+            success_threshold: default_success_threshold(),
+            timeout_secs: default_timeout(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct TimeoutConfig {
+    #[serde(default = "default_connect_timeout")]
+    pub connect_secs: u64,
+    #[serde(default = "default_read_timeout")]
+    pub read_secs: u64,
+    #[serde(default = "default_write_timeout")]
+    pub write_secs: u64,
+}
+
+fn default_connect_timeout() -> u64 { 10 }
+fn default_read_timeout() -> u64 { 60 }
+fn default_write_timeout() -> u64 { 60 }
+
+impl Default for TimeoutConfig {
+    fn default() -> Self {
+        Self {
+            connect_secs: default_connect_timeout(),
+            read_secs: default_read_timeout(),
+            write_secs: default_write_timeout(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct ShutdownConfig {
+    #[serde(default = "default_grace_period")]
+    pub grace_period_secs: u64,
+}
+
+fn default_grace_period() -> u64 { 30 }
+
+impl Default for ShutdownConfig {
+    fn default() -> Self {
+        Self {
+            grace_period_secs: default_grace_period(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -26,6 +177,14 @@ pub struct ProviderConfig {
     pub api_url: Option<Url>,
     #[serde(default = "default_true")]
     pub enabled: bool,
+    #[serde(default)]
+    pub rate_limit: Option<ProviderRateLimitConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderRateLimitConfig {
+    pub rpm: Option<u32>,
+    pub tpm: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -53,32 +212,8 @@ fn default_port() -> u16 {
     8899
 }
 
-fn default_true() -> bool {
-    true
-}
-
-fn openai_api_url() -> Result<Url> {
-    "https://api.openai.com/"
-        .parse::<Url>()
-        .context("Failed to parse OpenAI API URL")
-}
-
-fn anthropic_api_url() -> Result<Url> {
-    "https://api.anthropic.com/"
-        .parse::<Url>()
-        .context("Failed to parse Anthropic API URL")
-}
-
-fn gemini_api_url() -> Result<Url> {
-    "https://generativelanguage.googleapis.com/"
-        .parse::<Url>()
-        .context("Failed to parse Gemini API URL")
-}
-
 impl Config {
-    /// 加载配置 (优先级: 配置文件 < 环境变量 < CLI 参数)
     pub fn load() -> Config {
-        // 1. 尝试从配置文件加载
         if let Ok(config_path) = std::env::var("CREWRIDE_CONFIG_FILE") {
             println!("📄 Loading config from: {}", config_path);
             match Config::from_file(&config_path) {
@@ -93,7 +228,6 @@ impl Config {
             }
         }
 
-        // 2. 尝试自动搜索配置文件
         if let Ok(current_dir) = std::env::current_dir() {
             println!("🔍 Searching for config files in current directory");
             match Config::from_dir(&current_dir) {
@@ -107,7 +241,6 @@ impl Config {
             }
         }
 
-        // 3. 使用默认配置 + 环境变量
         let mut config = Config::default();
         if let Err(e) = config.merge_env() {
             eprintln!("⚠️  Warning: Failed to merge environment variables: {}", e);
@@ -115,7 +248,6 @@ impl Config {
         config
     }
 
-    /// 从 JSON 或 YAML 文件加载配置
     pub fn from_file(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         let contents = std::fs::read_to_string(path)
@@ -143,7 +275,6 @@ impl Config {
             None => return Err(anyhow!("File must have an extension (.json or .yaml)")),
         };
 
-        // 合并环境变量
         config.merge_env().with_context(|| {
             format!("Failed to merge environment variables for config: {}", path.display())
         })?;
@@ -151,13 +282,10 @@ impl Config {
         Ok(config)
     }
 
-    /// 自动搜索并加载配置文件（支持 JSON 和 YAML）
-    /// 搜索优先级: config.json, config.yaml, config.yml
     pub fn from_dir(dir: impl AsRef<Path>) -> Result<Self> {
         let dir = dir.as_ref();
         println!("🔍 Searching for config files in: {}", dir.display());
 
-        // 按优先级搜索配置文件
         let candidates = ["config.json", "config.yaml", "config.yml"];
 
         for filename in &candidates {
@@ -171,9 +299,7 @@ impl Config {
         Err(anyhow!("No config file found in directory: {}", dir.display()))
     }
 
-    /// 合并环境变量 (环境变量优先级更高)
     pub fn merge_env(&mut self) -> Result<()> {
-        // 更新提供商配置中的API密钥和URL
         for provider in &mut self.providers {
             match provider.r#type {
                 Provider::OpenAI => {
@@ -209,12 +335,10 @@ impl Config {
             }
         }
 
-        // 读取 host
         if let Ok(host) = std::env::var("CREWRIDE_PROXY_HOST") {
             self.host = host;
         }
 
-        // 读取 port
         if let Ok(port) = std::env::var("CREWRIDE_PROXY_PORT") {
             if let Ok(port_num) = port.parse() {
                 self.port = port_num;
@@ -224,7 +348,6 @@ impl Config {
         Ok(())
     }
 
-    /// 验证配置
     pub fn validate(&self) {
         for provider in &self.providers {
             if provider.enabled && provider.api_key.is_none() {
@@ -233,17 +356,14 @@ impl Config {
         }
     }
 
-    /// 根据模型名查找模型配置
     pub fn find_model(&self, model: &str) -> Option<&ModelConfig> {
         self.models.iter().find(|m| m.model == model)
     }
 
-    /// 根据提供商key查找提供商配置
     pub fn find_provider(&self, key: &str) -> Option<&ProviderConfig> {
         self.providers.iter().find(|p| p.key == key && p.enabled)
     }
 
-    /// 根据提供商类型查找出一个可用供商配置
     pub fn give_provider(&self, r#type: Provider) -> Option<&ProviderConfig> {
         self.providers.iter().find(|p| p.r#type == r#type && p.enabled)
     }
@@ -256,6 +376,67 @@ impl Default for Config {
             port: default_port(),
             providers: Vec::new(),
             models: Vec::new(),
+            stats: StatsConfig::default(),
+            rate_limit: RateLimitConfig::default(),
+            retry: RetryConfig::default(),
+            circuit_breaker: CircuitBreakerConfig::default(),
+            timeout: TimeoutConfig::default(),
+            shutdown: ShutdownConfig::default(),
+        }
+    }
+}
+
+fn openai_api_url() -> Result<Url> {
+    "https://api.openai.com/"
+        .parse::<Url>()
+        .context("Failed to parse OpenAI API URL")
+}
+
+fn anthropic_api_url() -> Result<Url> {
+    "https://api.anthropic.com/"
+        .parse::<Url>()
+        .context("Failed to parse Anthropic API URL")
+}
+
+fn gemini_api_url() -> Result<Url> {
+    "https://generativelanguage.googleapis.com/"
+        .parse::<Url>()
+        .context("Failed to parse Gemini API URL")
+}
+
+#[derive(Clone)]
+pub struct AppState {
+    pub client: reqwest::Client,
+    pub config: Config,
+    pub stats: crate::stats::StatsCollector,
+    pub rate_limiter: crate::rate_limit::RateLimiter,
+    pub circuit_breakers: crate::circuit_breaker::CircuitBreakerRegistry,
+    pub health_status: Arc<RwLock<std::collections::HashMap<String, bool>>>,
+}
+
+impl AppState {
+    pub fn new(config: Config) -> Self {
+        let timeout = config.timeout;
+        let client = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(timeout.connect_secs))
+            .read_timeout(std::time::Duration::from_secs(timeout.read_secs))
+            .build()
+            .expect("Failed to create HTTP client");
+
+        Self {
+            client,
+            config,
+            stats: crate::stats::StatsCollector::new(),
+            rate_limiter: crate::rate_limit::RateLimiter::new(
+                crate::rate_limit::RateLimitConfig {
+                    enabled: true,
+                    default_rpm: 60,
+                    default_tpm: 100000,
+                    burst: 10,
+                }
+            ),
+            circuit_breakers: crate::circuit_breaker::CircuitBreakerRegistry::new(),
+            health_status: Arc::new(RwLock::new(std::collections::HashMap::new())),
         }
     }
 }

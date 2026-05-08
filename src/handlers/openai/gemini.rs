@@ -8,12 +8,11 @@ use aidapter::{
     gemini::prefix::{GeminiChatResponse, GeminiStreamChunk},
     openai::prefix::{OpenAIChatResponse, OpenAIStreamChunk},
 };
-
-// ============ 流式转换: Gemini → OpenAI ============
+use crate::error::ProxyError;
 
 pub async fn from_gemini_streaming(
     response: reqwest::Response,
-) -> Result<Response, StatusCode> {
+) -> Result<Response, ProxyError> {
     use eventsource_stream::Eventsource;
 
     let byte_stream = response.bytes_stream();
@@ -26,16 +25,13 @@ pub async fn from_gemini_streaming(
                     return Some(Ok::<_, std::io::Error>(b"data: [DONE]\n\n".to_vec()));
                 }
 
-                // 解析Gemini流式响应
                 let gemini_chunk: GeminiStreamChunk = match serde_json::from_str(&event.data) {
                     Ok(chunk) => chunk,
                     Err(_) => return None,
                 };
 
-                // 转换为OpenAI流式块
                 let openai_chunks = Vec::<OpenAIStreamChunk>::from(&gemini_chunk);
                 
-                // 序列化为OpenAI SSE格式
                 let bytes: Vec<u8> = openai_chunks
                     .iter()
                     .flat_map(|chunk| Vec::<u8>::from(chunk))
@@ -51,13 +47,11 @@ pub async fn from_gemini_streaming(
     Ok((StatusCode::OK, [("content-type", "text/event-stream")], body).into_response())
 }
 
-// ============ 非流式响应转换 ============
-
-pub async fn from_gemini_response(response: reqwest::Response) -> Result<Response, StatusCode> {
+pub async fn from_gemini_response(response: reqwest::Response) -> Result<Response, ProxyError> {
     let resp: GeminiChatResponse = response
         .json()
         .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(|_| ProxyError::Internal("Failed to parse response".to_string()))?;
 
     Ok(Json(OpenAIChatResponse::from(&resp)).into_response())
 }
